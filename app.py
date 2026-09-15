@@ -189,6 +189,10 @@ def build_meter_catalog(
             ServiceRegion=("ServiceRegion", "first"),
             ServiceResource=("ServiceResource", "first"),
             SubscriptionCount=("SubscriptionName", "nunique"),
+            Subscriptions=(
+                "SubscriptionName",
+                lambda values: ", ".join(sorted(set(values.astype(str)))),
+            ),
             FirstUsage=("Date", "min"),
             LastUsage=("Date", "max"),
         )
@@ -211,7 +215,26 @@ def build_meter_catalog(
             UsageRows=("Date", "size"),
         )
     )
+    subscription_costs = (
+        filtered.groupby(["ResourceGuid", "SubscriptionName"], as_index=False)["Cost"]
+        .sum()
+        .sort_values(["ResourceGuid", "Cost"], ascending=[True, False])
+    )
+    subscription_splits = (
+        subscription_costs.assign(
+            SubscriptionCost=subscription_costs.apply(
+                lambda row: f"{row['SubscriptionName']}: {money(row['Cost'])}", axis=1
+            )
+        )
+        .groupby("ResourceGuid", as_index=False)["SubscriptionCost"]
+        .agg("; ".join)
+        .rename(columns={"SubscriptionCost": "FilteredSubscriptionCosts"})
+    )
     catalog = catalog.merge(filtered_totals, on="ResourceGuid", how="left")
+    catalog = catalog.merge(subscription_splits, on="ResourceGuid", how="left")
+    catalog["FilteredSubscriptionCosts"] = catalog["FilteredSubscriptionCosts"].fillna(
+        "No usage in filtered range"
+    )
     catalog = catalog.merge(period_totals(current_period, "Current"), on="ResourceGuid", how="left")
     catalog = catalog.merge(period_totals(previous_period, "Previous"), on="ResourceGuid", how="left")
     numeric_columns = [
@@ -284,7 +307,8 @@ min_date = df["Date"].min().date()
 max_date = df["Date"].max().date()
 subscriptions = sorted(df["SubscriptionName"].unique())
 services = sorted(df["ServiceName"].unique())
-data_signature = (len(df), str(min_date), str(max_date), tuple(subscriptions), tuple(services))
+meters = tuple(sorted(df["ResourceGuid"].unique()))
+data_signature = (len(df), str(min_date), str(max_date), tuple(subscriptions), tuple(services), meters)
 
 if st.session_state.get("data_signature") != data_signature:
     st.session_state.data_signature = data_signature
@@ -379,6 +403,25 @@ if fdf.empty:
     st.warning("No usage rows match the applied filters. Change the filters and click Apply filters.")
     st.stop()
 
+subscription_summary = (
+    fdf.groupby("SubscriptionName", as_index=False)
+    .agg(Cost=("Cost", "sum"), UsageRows=("Cost", "size"), Meters=("ResourceGuid", "nunique"))
+    .sort_values("Cost", ascending=False)
+)
+contributing_subscriptions = subscription_summary["SubscriptionName"].tolist()
+noncontributing_subscriptions = sorted(
+    set(applied["subscriptions"]) - set(contributing_subscriptions)
+)
+
+with st.sidebar:
+    st.subheader("Data included")
+    for row in subscription_summary.itertuples(index=False):
+        st.markdown(f"**{row.SubscriptionName}**  \n{money(row.Cost)} · {row.UsageRows:,} rows")
+    if noncontributing_subscriptions:
+        st.caption(
+            "No rows in the applied date range: " + ", ".join(noncontributing_subscriptions)
+        )
+
 granularity = applied["granularity"]
 top_n = applied["top_n"]
 current_start, current_end, previous_start, previous_end = comparison_windows(applied["end"], granularity)
@@ -412,6 +455,17 @@ st.caption(
     f"Showing {len(fdf):,} rows · {applied['start']:%d %b %Y} to {applied['end']:%d %b %Y} · "
     f"{granularity.lower()} comparison"
 )
+if len(applied["subscriptions"]) > 1:
+    if noncontributing_subscriptions:
+        st.warning(
+            f"{len(applied['subscriptions'])} subscriptions are selected, but this date range contains usage from "
+            f"{len(contributing_subscriptions)}: {', '.join(contributing_subscriptions)}."
+        )
+    else:
+        st.info(
+            "This view combines data from: " + ", ".join(contributing_subscriptions) + ". "
+            "Subscription attribution is shown below and in the meter catalog."
+        )
 
 k1, k2, k3, k4, k5 = st.columns(5)
 with k1.container(border=True):
@@ -467,6 +521,35 @@ overview_tab, drivers_tab, resources_tab, meters_tab, details_tab = st.tabs(
 )
 
 with overview_tab:
+    st.subheader("Cost by subscription")
+    subscription_chart = subscription_summary.sort_values("Cost", ascending=True)
+    subscription_colors = {
+        name: DARK_HUES[index % len(DARK_HUES)]
+        for index, name in enumerate(sorted(subscription_chart["SubscriptionName"]))
+    }
+    fig_subscription = px.bar(
+        subscription_chart,
+        x="Cost",
+        y="SubscriptionName",
+        orientation="h",
+        color="SubscriptionName",
+        color_discrete_map=subscription_colors,
+        custom_data=["UsageRows", "Meters"],
+        height=max(280, 90 * len(subscription_chart) + 120),
+    )
+    fig_subscription.update_traces(
+        texttemplate="$%{x:,.2f}",
+        textposition="outside",
+        cliponaxis=False,
+        hovertemplate=(
+            "%{y}<br>Cost: $%{x:,.2f}<br>Rows: %{customdata[0]:,}"
+            "<br>Billing meters: %{customdata[1]:,}<extra></extra>"
+        ),
+    )
+    fig_subscription.update_layout(xaxis_title="Cost ($)", yaxis_title=None)
+    style_fig(fig_subscription, showlegend=False)
+    st.plotly_chart(fig_subscription, width="stretch")
+
     st.subheader(f"Cost trend · {granularity.lower()}")
     fdf["Period"] = period_start(fdf["Date"], granularity)
     ranked_services = list(service_cost.index[:top_n])
@@ -630,7 +713,10 @@ with resources_tab:
         scoped_change = percent_change(scoped_current_cost, scoped_previous_cost)
 
         st.subheader(f"Billing meter {meter_id[:8]}")
-        st.caption(f"{row['ServiceName']} / {row['ServiceType']} / {row['ServiceResource']} / {row['ServiceRegion']}")
+        st.caption(
+            f"Subscription: {row['SubscriptionName']}  \n"
+            f"{row['ServiceName']} / {row['ServiceType']} / {row['ServiceResource']} / {row['ServiceRegion']}"
+        )
         atomic_cols = st.columns(4)
         atomic_cols[0].metric("Cost", money(scoped["Cost"].sum()))
         atomic_cols[1].metric("Quantity", f"{scoped_quantity:,.4f}")
@@ -782,6 +868,8 @@ with meters_tab:
         "ServiceType",
         "ServiceRegion",
         "ServiceResource",
+        "Subscriptions",
+        "FilteredSubscriptionCosts",
         "FilteredCost",
         "FilteredQuantity",
         "EffectiveCostPerUnit",
@@ -824,6 +912,10 @@ with meters_tab:
             "ServiceType": st.column_config.TextColumn("Service type"),
             "ServiceRegion": st.column_config.TextColumn("Region"),
             "ServiceResource": st.column_config.TextColumn("SKU"),
+            "Subscriptions": st.column_config.TextColumn("Subscriptions", width="large"),
+            "FilteredSubscriptionCosts": st.column_config.TextColumn(
+                "Cost by subscription", width="large"
+            ),
             "FilteredCost": st.column_config.NumberColumn("Filtered cost", format="$%.2f"),
             "FilteredQuantity": st.column_config.NumberColumn("Quantity", format="%.4f"),
             "EffectiveCostPerUnit": st.column_config.NumberColumn("Effective cost / quantity", format="$%.6f"),
@@ -845,7 +937,7 @@ with meters_tab:
     )
 
     st.subheader("Meter analysis")
-    meter_options = meter_catalog.loc[meter_catalog["FilteredCost"].ne(0), "ResourceGuid"].tolist()
+    meter_options = meter_catalog.loc[meter_catalog["UsageRows"].gt(0), "ResourceGuid"].tolist()
     meter_labels = {
         row["ResourceGuid"]: meter_display_label(row)
         for _, row in meter_catalog.iterrows()
@@ -854,6 +946,13 @@ with meters_tab:
         "Billing meter",
         meter_options,
         format_func=lambda meter_id: meter_labels[meter_id],
+    )
+    selected_meter_summary = meter_catalog.loc[
+        meter_catalog["ResourceGuid"] == selected_meter
+    ].iloc[0]
+    st.caption(
+        f"Subscriptions: {selected_meter_summary['Subscriptions']}  \n"
+        f"Filtered cost attribution: {selected_meter_summary['FilteredSubscriptionCosts']}"
     )
     selected_meter_rows = fdf[fdf["ResourceGuid"] == selected_meter].copy()
     selected_meter_rows["Period"] = period_start(selected_meter_rows["Date"], granularity)

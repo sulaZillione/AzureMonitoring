@@ -27,11 +27,16 @@ class DashboardTests(unittest.TestCase):
         meter_tables = [frame.value for frame in self.app.dataframe if "ResourceGuid" in frame.value.columns]
         self.assertEqual(len(meter_tables), 1)
         self.assertEqual(len(meter_tables[0]), 52)
+        self.assertIn("Subscriptions", meter_tables[0].columns)
+        self.assertIn("FilteredSubscriptionCosts", meter_tables[0].columns)
         detail_table = next(
             frame.value for frame in self.app.dataframe if "Billing meter GUID" in frame.value.columns
         )
         self.assertAlmostEqual(meter_tables[0]["FilteredCost"].sum(), detail_table["Cost"].sum(), places=6)
-        self.assertEqual(len(self.app.get("plotly_chart")), 10)
+        self.assertEqual(len(self.app.get("plotly_chart")), 11)
+        self.assertTrue(
+            any("2 subscriptions are selected" in warning.value for warning in self.app.warning)
+        )
 
     def test_monthly_comparison_uses_equal_elapsed_days(self):
         filters = dict(self.app.session_state["applied_filters"])
