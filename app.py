@@ -315,6 +315,11 @@ with st.sidebar:
                 f"**{item['Source file']}{worksheet}**  \n"
                 f"{item['Rows']:,} rows · {item['Subscriptions']} subscriptions · {money(item['Cost'])}"
             )
+    if data_meta["date_corrections"]:
+        st.warning(
+            f"Corrected {data_meta['date_corrections']:,} dates that Excel partially converted "
+            "with the month and day reversed."
+        )
     st.caption(f"Data available: {min_date:%d %b %Y} – {max_date:%d %b %Y}")
     st.header("Filters")
     st.caption("Changes take effect only when you click Apply filters.")

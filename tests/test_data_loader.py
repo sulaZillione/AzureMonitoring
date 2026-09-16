@@ -1,5 +1,6 @@
 import io
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -71,6 +72,29 @@ class DataLoaderTests(unittest.TestCase):
         invalid = self.csv_source(pd.DataFrame({"Date": ["2026-01-01"]}), "broken.csv")
         with self.assertRaisesRegex(ValueError, "broken.csv: missing required columns"):
             load_usage_sources([invalid])
+
+    def test_repairs_partial_excel_month_day_conversion(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Usage"
+        sheet.append(self.sample.columns.tolist())
+        rows = self.sample.iloc[:3].copy()
+        dates = ["8/20/2025", datetime(2025, 10, 9), datetime(2026, 12, 8)]
+        for values, usage_date in zip(rows.itertuples(index=False, name=None), dates):
+            output = [value.item() if hasattr(value, "item") else value for value in values]
+            output[rows.columns.get_loc("Date")] = usage_date
+            sheet.append(output)
+        content = io.BytesIO()
+        workbook.save(content)
+        source = NamedBytesIO(content.getvalue(), "mixed-dates.xlsx")
+
+        combined, metadata = load_usage_sources([source])
+
+        self.assertEqual(
+            combined["Date"].dt.strftime("%Y-%m-%d").tolist(),
+            ["2025-08-20", "2025-09-10", "2026-08-12"],
+        )
+        self.assertEqual(metadata["date_corrections"], 2)
 
 
 if __name__ == "__main__":

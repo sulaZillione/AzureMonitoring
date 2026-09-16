@@ -1,5 +1,6 @@
 """Load and normalize one or more Azure usage CSV/XLSX exports."""
 
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -43,6 +44,51 @@ def _clean_columns(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def normalize_usage_dates(values: pd.Series) -> tuple[pd.Series, int]:
+    """Parse usage dates and repair Excel's partial day/month conversion pattern."""
+    native_mask = values.map(lambda value: isinstance(value, (date, datetime, pd.Timestamp)))
+    text_mask = values.notna() & ~native_mask
+    text_values = values.loc[text_mask].astype(str).str.strip()
+    date_parts = text_values.str.extract(
+        r"^(?P<first>\d{1,2})[/-](?P<second>\d{1,2})[/-](?P<year>\d{4})(?:\s.*)?$"
+    ).apply(pd.to_numeric, errors="coerce")
+    month_first_evidence = (
+        date_parts["first"].between(1, 12) & date_parts["second"].gt(12)
+    ).any()
+    day_first_evidence = (
+        date_parts["first"].gt(12) & date_parts["second"].between(1, 12)
+    ).any()
+
+    native_dates = pd.to_datetime(values.loc[native_mask], errors="coerce")
+    partial_excel_conversion = (
+        native_mask.any()
+        and text_mask.any()
+        and month_first_evidence
+        and not day_first_evidence
+        and native_dates.notna().all()
+        and native_dates.dt.day.le(12).all()
+    )
+
+    if not partial_excel_conversion:
+        return pd.to_datetime(values, errors="coerce", format="mixed"), 0
+
+    parsed = pd.Series(pd.NaT, index=values.index, dtype="datetime64[ns]")
+    parsed.loc[text_mask] = pd.to_datetime(
+        text_values,
+        errors="coerce",
+        format="mixed",
+        dayfirst=False,
+    )
+    corrected_native = native_dates.map(
+        lambda value: value.replace(month=value.day, day=value.month)
+    )
+    parsed.loc[native_mask] = corrected_native
+    correction_count = int(
+        (native_dates.dt.month.to_numpy() != native_dates.dt.day.to_numpy()).sum()
+    )
+    return parsed, correction_count
+
+
 def _read_tables(source, display_name: str) -> list[tuple[str, pd.DataFrame]]:
     suffix = Path(display_name).suffix.lower()
     try:
@@ -70,14 +116,14 @@ def _normalize_table(
     frame: pd.DataFrame,
     source_file: str,
     source_sheet: str,
-) -> tuple[pd.DataFrame, dict, list[str]]:
+) -> tuple[pd.DataFrame, dict, list[str], int]:
     missing = sorted(REQUIRED_COLUMNS - set(frame.columns))
     if missing:
         raise ValueError(f"missing required columns: {', '.join(missing)}")
     if frame.empty:
         raise ValueError("contains headers but no usage rows")
 
-    parsed_dates = pd.to_datetime(frame["Date"], errors="coerce")
+    parsed_dates, date_corrections = normalize_usage_dates(frame["Date"])
     parsed_cost = pd.to_numeric(frame["Cost"], errors="coerce")
     parsed_quantity = pd.to_numeric(frame["Quantity"], errors="coerce")
     problems = []
@@ -108,7 +154,7 @@ def _normalize_table(
     frame, identity_metadata = add_resource_identity(frame)
     frame["AnalysisSourceFile"] = source_file
     frame["AnalysisSourceSheet"] = source_sheet
-    return frame, identity_metadata, original_columns
+    return frame, identity_metadata, original_columns, date_corrections
 
 
 def load_usage_sources(sources) -> tuple[pd.DataFrame, dict]:
@@ -126,6 +172,7 @@ def load_usage_sources(sources) -> tuple[pd.DataFrame, dict]:
     resource_id_sources = set()
     has_resource_identity = False
     has_resource_group = False
+    total_date_corrections = 0
     filename_occurrences: dict[str, int] = {}
 
     for source in sources:
@@ -141,7 +188,7 @@ def load_usage_sources(sources) -> tuple[pd.DataFrame, dict]:
 
         for sheet_name, raw_frame in tables:
             try:
-                frame, identity_metadata, table_columns = _normalize_table(
+                frame, identity_metadata, table_columns, date_corrections = _normalize_table(
                     raw_frame,
                     source_label,
                     sheet_name,
@@ -164,6 +211,7 @@ def load_usage_sources(sources) -> tuple[pd.DataFrame, dict]:
                 has_resource_identity or identity_metadata["has_resource_identity"]
             )
             has_resource_group = has_resource_group or identity_metadata["has_resource_group"]
+            total_date_corrections += date_corrections
 
             summaries.append(
                 {
@@ -174,6 +222,7 @@ def load_usage_sources(sources) -> tuple[pd.DataFrame, dict]:
                     "Cost": frame["Cost"].sum(),
                     "First usage": frame["Date"].min(),
                     "Last usage": frame["Date"].max(),
+                    "Excel date corrections": date_corrections,
                 }
             )
 
@@ -194,5 +243,6 @@ def load_usage_sources(sources) -> tuple[pd.DataFrame, dict]:
         "source_file_count": len(sources),
         "source_table_count": len(summaries),
         "source_summaries": summaries,
+        "date_corrections": total_date_corrections,
     }
     return combined, metadata
