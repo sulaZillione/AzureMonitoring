@@ -535,29 +535,59 @@ with overview_tab:
     st.plotly_chart(fig_subscription, width="stretch")
 
     st.subheader(f"Cost trend · {granularity.lower()}")
-    fdf["Period"] = period_start(fdf["Date"], granularity)
-    ranked_services = list(service_cost.index[:top_n])
-    fdf["ServiceGroup"] = fdf["ServiceName"].where(fdf["ServiceName"].isin(ranked_services), "Other")
-    trend = fdf.groupby(["Period", "ServiceGroup"], as_index=False)["Cost"].sum()
-    service_colors = {name: DARK_HUES[i % len(DARK_HUES)] for i, name in enumerate(ranked_services)}
-    service_colors["Other"] = OTHER_COLOR
-    order = [name for name in ranked_services if name in trend["ServiceGroup"].unique()]
-    if "Other" in trend["ServiceGroup"].unique():
-        order.append("Other")
+    trend_subscription_options = sorted(fdf["SubscriptionName"].unique())
+    trend_filter_key = "trend_subscription_filter"
+    trend_options_key = "trend_subscription_options"
+    prior_trend_options = st.session_state.get(trend_options_key)
+    if prior_trend_options != trend_subscription_options:
+        prior_selection = st.session_state.get(trend_filter_key, [])
+        valid_selection = [
+            value for value in prior_selection if value in trend_subscription_options
+        ]
+        st.session_state[trend_filter_key] = valid_selection or trend_subscription_options
+        st.session_state[trend_options_key] = trend_subscription_options
 
-    fig_trend = px.bar(
-        trend,
-        x="Period",
-        y="Cost",
-        color="ServiceGroup",
-        color_discrete_map=service_colors,
-        category_orders={"ServiceGroup": order},
-        labels={"ServiceGroup": "Service"},
+    trend_subscriptions = st.multiselect(
+        "Subscriptions in cost trend",
+        trend_subscription_options,
+        key=trend_filter_key,
+        help="This selection changes only the cost trend chart.",
     )
-    fig_trend.update_layout(xaxis_title=None, yaxis_title="Cost ($)", barmode="stack")
-    fig_trend.update_traces(hovertemplate="%{x|%d %b %Y}<br>%{fullData.name}: $%{y:,.2f}<extra></extra>")
-    style_fig(fig_trend)
-    st.plotly_chart(fig_trend, width="stretch")
+
+    if not trend_subscriptions:
+        st.info("Select at least one subscription to display the cost trend.")
+    else:
+        trend_df = fdf[fdf["SubscriptionName"].isin(trend_subscriptions)].copy()
+        trend_df["Period"] = period_start(trend_df["Date"], granularity)
+        trend_service_cost = trend_df.groupby("ServiceName")["Cost"].sum().sort_values(ascending=False)
+        ranked_services = list(trend_service_cost.index[:top_n])
+        trend_df["ServiceGroup"] = trend_df["ServiceName"].where(
+            trend_df["ServiceName"].isin(ranked_services), "Other"
+        )
+        trend = trend_df.groupby(["Period", "ServiceGroup"], as_index=False)["Cost"].sum()
+        service_colors = {
+            name: DARK_HUES[i % len(DARK_HUES)] for i, name in enumerate(ranked_services)
+        }
+        service_colors["Other"] = OTHER_COLOR
+        order = [name for name in ranked_services if name in trend["ServiceGroup"].unique()]
+        if "Other" in trend["ServiceGroup"].unique():
+            order.append("Other")
+
+        fig_trend = px.bar(
+            trend,
+            x="Period",
+            y="Cost",
+            color="ServiceGroup",
+            color_discrete_map=service_colors,
+            category_orders={"ServiceGroup": order},
+            labels={"ServiceGroup": "Service"},
+        )
+        fig_trend.update_layout(xaxis_title=None, yaxis_title="Cost ($)", barmode="stack")
+        fig_trend.update_traces(
+            hovertemplate="%{x|%d %b %Y}<br>%{fullData.name}: $%{y:,.2f}<extra></extra>"
+        )
+        style_fig(fig_trend)
+        st.plotly_chart(fig_trend, width="stretch")
 
     st.subheader("Where the money goes")
     tree_data = fdf.groupby(["SubscriptionName", "ServiceName", "ServiceRegion"], as_index=False)["Cost"].sum()

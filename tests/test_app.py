@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -47,6 +48,40 @@ class DashboardTests(unittest.TestCase):
         comparison = next(metric for metric in self.app.metric if metric.label.startswith("Spend"))
         self.assertIn("Sep 01", comparison.label)
         self.assertIn("Sep 09", comparison.label)
+
+    def test_cost_trend_can_filter_by_subscription(self):
+        data = pd.read_csv(self.project_dir / "AzureUsage 1.csv")
+        dates = pd.to_datetime(data["Date"])
+        filters = dict(self.app.session_state["applied_filters"])
+        filters.update(
+            {
+                "preset": "All available data",
+                "start": dates.min().date(),
+                "end": dates.max().date(),
+                "subscriptions": sorted(data["SubscriptionName"].unique()),
+            }
+        )
+        self.app.session_state["applied_filters"] = filters
+        self.app.run()
+
+        trend_filter = next(
+            item for item in self.app.multiselect if item.label == "Subscriptions in cost trend"
+        )
+        self.assertEqual(set(trend_filter.options), set(filters["subscriptions"]))
+        selected_subscription = "Zillione Azure Sponsorship MST 24-25"
+        trend_filter.set_value([selected_subscription])
+        self.app.run()
+
+        self.assertEqual(
+            self.app.session_state["trend_subscription_filter"],
+            [selected_subscription],
+        )
+        trend_chart = self.app.get("plotly_chart")[1]
+        trace_names = {trace["name"] for trace in json.loads(trend_chart.proto.spec)["data"]}
+        selected_services = set(
+            data.loc[data["SubscriptionName"] == selected_subscription, "ServiceName"]
+        )
+        self.assertTrue(trace_names.issubset(selected_services | {"Other"}))
 
     def test_full_meter_drill_path_renders(self):
         data = pd.read_csv(self.project_dir / "AzureUsage 1.csv")
