@@ -5,7 +5,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from data_helpers import add_resource_identity
+from data_loader import load_usage_sources
 from pricing_client import enrich_meter_records
 
 
@@ -13,18 +13,6 @@ st.set_page_config(page_title="Azure Cost Intelligence", page_icon="☁️", lay
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_CSV = APP_DIR / "AzureUsage 1.csv"
-
-REQUIRED_COLUMNS = {
-    "SubscriptionName",
-    "Date",
-    "ResourceGuid",
-    "ServiceName",
-    "ServiceType",
-    "ServiceRegion",
-    "ServiceResource",
-    "Quantity",
-    "Cost",
-}
 
 DARK_HUES = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#9085e9", "#00a6a6"]
 OTHER_COLOR = "#6b6a64"
@@ -47,46 +35,8 @@ PRESETS = [
 
 
 @st.cache_data(show_spinner="Reading Azure usage data…")
-def load_data(source) -> tuple[pd.DataFrame, dict]:
-    df = pd.read_csv(source)
-    df.columns = df.columns.astype(str).str.strip()
-
-    missing = sorted(REQUIRED_COLUMNS - set(df.columns))
-    if missing:
-        raise ValueError(f"The CSV is missing required columns: {', '.join(missing)}")
-
-    parsed_dates = pd.to_datetime(df["Date"], errors="coerce")
-    parsed_cost = pd.to_numeric(df["Cost"], errors="coerce")
-    parsed_quantity = pd.to_numeric(df["Quantity"], errors="coerce")
-    problems = []
-    if parsed_dates.isna().any():
-        problems.append(f"{parsed_dates.isna().sum():,} invalid Date values")
-    if parsed_cost.isna().any():
-        problems.append(f"{parsed_cost.isna().sum():,} invalid Cost values")
-    if parsed_quantity.isna().any():
-        problems.append(f"{parsed_quantity.isna().sum():,} invalid Quantity values")
-    if problems:
-        raise ValueError("The CSV could not be safely analysed: " + "; ".join(problems))
-
-    df["Date"] = parsed_dates
-    df["Cost"] = parsed_cost
-    df["Quantity"] = parsed_quantity
-
-    dimensions = [
-        "SubscriptionName",
-        "ServiceName",
-        "ServiceType",
-        "ServiceRegion",
-        "ServiceResource",
-        "ResourceGuid",
-    ]
-    for column in dimensions:
-        df[column] = df[column].fillna("Unknown").astype(str)
-
-    original_columns = list(df.columns)
-    df, identity_metadata = add_resource_identity(df)
-    metadata = {"original_columns": original_columns, **identity_metadata}
-    return df, metadata
+def load_data(sources) -> tuple[pd.DataFrame, dict]:
+    return load_usage_sources(sources)
 
 
 def resolve_date_range(preset: str, custom_range, min_date, max_date):
@@ -294,11 +244,16 @@ with title_col:
 
 with st.sidebar:
     st.header("Data source")
-    uploaded = st.file_uploader("Upload a newer Azure usage CSV", type="csv")
-    source = uploaded if uploaded is not None else DEFAULT_CSV
+    uploaded = st.file_uploader(
+        "Upload Azure usage files",
+        type=["csv", "xlsx"],
+        accept_multiple_files=True,
+        help="Select one or more CSV or Excel exports. Matching rows are combined for analysis.",
+    )
+    sources = tuple(uploaded) if uploaded else (DEFAULT_CSV,)
 
 try:
-    df, data_meta = load_data(source)
+    df, data_meta = load_data(sources)
 except (FileNotFoundError, pd.errors.ParserError, UnicodeDecodeError, ValueError) as exc:
     st.error(str(exc))
     st.stop()
@@ -308,7 +263,24 @@ max_date = df["Date"].max().date()
 subscriptions = sorted(df["SubscriptionName"].unique())
 services = sorted(df["ServiceName"].unique())
 meters = tuple(sorted(df["ResourceGuid"].unique()))
-data_signature = (len(df), str(min_date), str(max_date), tuple(subscriptions), tuple(services), meters)
+source_signature = tuple(
+    (
+        item["Source file"],
+        item["Worksheet"],
+        item["Rows"],
+        round(float(item["Cost"]), 6),
+    )
+    for item in data_meta["source_summaries"]
+)
+data_signature = (
+    len(df),
+    str(min_date),
+    str(max_date),
+    tuple(subscriptions),
+    tuple(services),
+    meters,
+    source_signature,
+)
 
 if st.session_state.get("data_signature") != data_signature:
     st.session_state.data_signature = data_signature
@@ -331,6 +303,18 @@ with status_col:
     st.metric("Rows loaded", f"{len(df):,}")
 
 with st.sidebar:
+    file_word = "file" if data_meta["source_file_count"] == 1 else "files"
+    st.caption(
+        f"Loaded {data_meta['source_file_count']} {file_word} · {len(df):,} rows · "
+        f"{len(subscriptions)} subscriptions"
+    )
+    with st.expander("Loaded sources"):
+        for item in data_meta["source_summaries"]:
+            worksheet = "" if item["Worksheet"] == "CSV" else f" / {item['Worksheet']}"
+            st.markdown(
+                f"**{item['Source file']}{worksheet}**  \n"
+                f"{item['Rows']:,} rows · {item['Subscriptions']} subscriptions · {money(item['Cost'])}"
+            )
     st.caption(f"Data available: {min_date:%d %b %Y} – {max_date:%d %b %Y}")
     st.header("Filters")
     st.caption("Changes take effect only when you click Apply filters.")
@@ -1030,6 +1014,8 @@ with details_tab:
     st.subheader("Filtered usage details")
     st.caption(f"{len(fdf):,} rows match the applied sidebar filters.")
     detail_columns = ["Date", "SubscriptionName"]
+    if data_meta["source_file_count"] > 1 or data_meta["source_table_count"] > 1:
+        detail_columns.extend(["AnalysisSourceFile", "AnalysisSourceSheet"])
     if data_meta["has_resource_group"]:
         detail_columns.append("AnalysisResourceGroup")
     detail_columns.extend(["ServiceName", "ServiceType", "ServiceRegion", "ServiceResource"])
@@ -1040,6 +1026,8 @@ with details_tab:
         columns={
             "AnalysisResourceGroup": "Resource group",
             "AnalysisResourceName": "Resource name",
+            "AnalysisSourceFile": "Source file",
+            "AnalysisSourceSheet": "Worksheet",
             "ResourceGuid": "Billing meter GUID",
         }
     )
@@ -1055,12 +1043,24 @@ with details_tab:
     )
     st.download_button(
         "Download filtered rows",
-        fdf[data_meta["original_columns"]].to_csv(index=False).encode("utf-8"),
+        fdf[data_meta["download_columns"]].to_csv(index=False).encode("utf-8"),
         file_name=f"azure_usage_{applied['start']}_{applied['end']}.csv",
         mime="text/csv",
     )
 
     st.subheader("Data quality and interpretation")
+    st.caption("Loaded-source reconciliation")
+    source_summary = pd.DataFrame(data_meta["source_summaries"])
+    st.dataframe(
+        source_summary,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Cost": st.column_config.NumberColumn(format="$%.2f"),
+            "First usage": st.column_config.DateColumn(format="DD MMM YYYY"),
+            "Last usage": st.column_config.DateColumn(format="DD MMM YYYY"),
+        },
+    )
     quality_cols = st.columns(5)
     quality_cols[0].metric("Missing required values", "0")
     quality_cols[1].metric("Duplicate rows", f"{df.duplicated(subset=data_meta['original_columns']).sum():,}")
